@@ -44,14 +44,17 @@ _log = logging.getLogger(__name__)
 
 # Full SHA pattern: 40 hex characters
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_FALLBACK_REFSPECS = (
+    "+refs/heads/*:refs/remotes/apm-fallback/*",
+    "+refs/tags/*:refs/tags/*",
+)
 
 
 def _safe_git_args() -> list[str]:
     """Return hardening ``-c`` args prepended to every git subprocess.
 
-    - ``core.hooksPath=/dev/null`` disables any hook script that a
-      malicious upstream might ship (``.git/hooks/post-checkout`` etc.)
-      so a clone or checkout cannot trigger arbitrary code execution.
+    - The canonical no-hooks arguments disable any hook script that a
+      malicious upstream might ship, so clone and checkout stay inert.
     - ``submodule.recurse=false`` prevents any subcommand from
       recursing into attacker-controlled submodule URLs.
 
@@ -60,12 +63,11 @@ def _safe_git_args() -> list[str]:
     truth for git subprocess invocation -- callers must use this
     helper rather than ad-hoc ``git`` argv construction.
     """
-    from ..utils.git_env import git_long_paths_args
+    from ..utils.git_env import git_long_paths_args, git_no_hooks_args
 
     return [
         *git_long_paths_args(),
-        "-c",
-        "core.hooksPath=/dev/null",
+        *git_no_hooks_args(),
         "-c",
         "submodule.recurse=false",
     ]
@@ -191,9 +193,10 @@ class GitCache:
         # Cache hit path (skip if refresh requested)
         if not self._refresh and checkout_dir.is_dir():
             if verify_checkout_sha(checkout_dir, sha):
-                _log.debug("Cache HIT: %s @ %s [%s]", url, sha[:12], variant)
+                _log.debug("Cache HIT: %s @ %s [%s]", _sanitize_url(url), sha[:12], variant)
                 with shard_lock(checkout_dir):
                     return self._finalize_sparse_checkout(
+                        url,
                         checkout_dir,
                         sparse_paths,
                         env=env,
@@ -225,6 +228,7 @@ class GitCache:
 
     def _finalize_sparse_checkout(
         self,
+        url: str,
         checkout_dir: Path,
         sparse_paths: list[str] | None,
         *,
@@ -233,16 +237,21 @@ class GitCache:
         """Repair and validate a sparse checkout before any cache return."""
         if not sparse_paths:
             return checkout_dir
-        from ..utils.git_env import get_git_executable, git_subprocess_env
+        from ..utils.git_env import get_git_executable, git_network_env, git_subprocess_env
 
         git_exe = get_git_executable()
-        subprocess_env = env if env is not None else git_subprocess_env()
+        subprocess_env = git_subprocess_env(env)
         dangling = repair_dangling_cone_symlinks(
             git_exe,
             checkout_dir,
             list(sparse_paths),
             env=subprocess_env,
             extra_git_args=_safe_git_args(),
+            repair_env_factory=lambda: git_network_env(
+                url,
+                env,
+                worktree=checkout_dir,
+            ),
         )
         if dangling is not None:
             _log.info(
@@ -297,24 +306,18 @@ class GitCache:
         Raises:
             RuntimeError: If resolution fails.
         """
-        from ..utils.git_env import get_git_executable, git_subprocess_env
+        from ..utils.git_env import git_remote_refs
 
-        git_exe = get_git_executable()
         # auth-delegated: cache-layer ref resolution runs after lockfile
         # already pinned the commit; no PAT->bearer fallback applies here
         # (env is sanitized, no embedded creds).
-        cmd = [git_exe, *_safe_git_args(), "ls-remote", url]
-        if ref:
-            cmd.append(ref)
-
-        subprocess_env = env if env is not None else git_subprocess_env()
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+            result = git_remote_refs(
+                url,
+                *((ref,) if ref else ()),
                 timeout=30,
-                env=subprocess_env,
+                env=env,
+                git_args=_safe_git_args(),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RuntimeError(
@@ -323,7 +326,8 @@ class GitCache:
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"git ls-remote failed for {_sanitize_url(url)}: {result.stderr.strip()}"
+                f"git ls-remote failed for {_sanitize_url(url)}: "
+                f"{_sanitize_url(result.stderr.strip())}"
             )
 
         # Parse ls-remote output: first column is SHA
@@ -376,7 +380,7 @@ class GitCache:
 
         Returns the path to the bare repo directory.
         """
-        from ..utils.git_env import get_git_executable, git_subprocess_env
+        from ..utils.git_env import get_git_executable, git_clone_env, git_no_templates_args
 
         bare_shard = shard_key + (_PARTIAL_BARE_SUFFIX if partial else "")
         bare_dir = self._db_root / bare_shard
@@ -406,11 +410,12 @@ class GitCache:
             staged.mkdir(parents=True, exist_ok=True)
             os.chmod(str(staged), 0o700)
 
-            subprocess_env = env if env is not None else git_subprocess_env()
+            subprocess_env = git_clone_env(url, env, staged, bare=True)
             clone_args = [
                 git_exe,
                 *_safe_git_args(),
                 "clone",
+                *git_no_templates_args(),
                 "--bare",
                 "--no-tags",
                 "--no-recurse-submodules",
@@ -437,6 +442,7 @@ class GitCache:
                     text=True,
                     timeout=300,
                     env=subprocess_env,
+                    stdin=subprocess.DEVNULL,
                     check=True,
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
@@ -463,6 +469,7 @@ class GitCache:
                                 git_exe,
                                 *_safe_git_args(),
                                 "clone",
+                                *git_no_templates_args(),
                                 "--bare",
                                 "--no-tags",
                                 "--no-recurse-submodules",
@@ -473,6 +480,7 @@ class GitCache:
                             text=True,
                             timeout=300,
                             env=subprocess_env,
+                            stdin=subprocess.DEVNULL,
                             check=True,
                         )
                         fallback_done = True
@@ -553,7 +561,12 @@ class GitCache:
         get the lock and return immediately. Critical for CI matrix
         builds where multiple jobs hit the same uncached repo.
         """
-        from ..utils.git_env import get_git_executable, git_subprocess_env
+        from ..utils.git_env import (
+            get_git_executable,
+            git_network_env,
+            git_no_templates_args,
+            git_subprocess_env,
+        )
 
         bare_shard = shard_key + (_PARTIAL_BARE_SUFFIX if promisor_url else "")
         bare_dir = self._db_root / bare_shard
@@ -583,11 +596,12 @@ class GitCache:
             if final_dir.is_dir() and verify_checkout_sha(final_dir, sha):
                 _log.debug(
                     "Write-dedup HIT under lock: %s @ %s [%s]",
-                    url,
+                    _sanitize_url(url),
                     sha[:12],
                     variant,
                 )
                 return self._finalize_sparse_checkout(
+                    url,
                     final_dir,
                     sparse_paths,
                     env=env,
@@ -599,7 +613,7 @@ class GitCache:
             os.chmod(str(staged), 0o700)
 
             git_exe = get_git_executable()
-            subprocess_env = env if env is not None else git_subprocess_env()
+            subprocess_env = git_subprocess_env(env)
 
             try:
                 # Clone from local bare repo (fast, no network).
@@ -613,6 +627,7 @@ class GitCache:
                         git_exe,
                         *_safe_git_args(),
                         "clone",
+                        *git_no_templates_args(),
                         "--local",
                         "--shared",
                         "--no-checkout",
@@ -634,6 +649,7 @@ class GitCache:
                     text=True,
                     timeout=60,
                     env=subprocess_env,
+                    stdin=subprocess.DEVNULL,
                     check=True,
                 )
                 if promisor_url:
@@ -654,7 +670,13 @@ class GitCache:
                         text=True,
                         timeout=10,
                         env=subprocess_env,
+                        stdin=subprocess.DEVNULL,
                         check=True,
+                    )
+                    subprocess_env = git_network_env(
+                        promisor_url,
+                        subprocess_env,
+                        worktree=staged,
                     )
                 if sparse_paths:
                     # Sparse-cone setup BEFORE checkout. Failures raise
@@ -682,6 +704,7 @@ class GitCache:
                     text=True,
                     timeout=60,
                     env=subprocess_env,
+                    stdin=subprocess.DEVNULL,
                     check=True,
                 )
                 if sparse_paths:
@@ -691,6 +714,7 @@ class GitCache:
                     # it resolves. Only fires when the narrow cone would
                     # otherwise ship a broken checkout.
                     self._finalize_sparse_checkout(
+                        url,
                         staged,
                         sparse_paths,
                         env=env,
@@ -727,14 +751,15 @@ class GitCache:
         from ..utils.git_env import get_git_executable, git_subprocess_env
 
         git_exe = get_git_executable()
-        subprocess_env = env if env is not None else git_subprocess_env()
+        subprocess_env = git_subprocess_env(env)
         try:
             result = subprocess.run(
-                [git_exe, *_safe_git_args(), "-C", str(bare_dir), "cat-file", "-t", sha],
+                [git_exe, *_safe_git_args(), "--git-dir", str(bare_dir), "cat-file", "-t", sha],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 env=subprocess_env,
+                stdin=subprocess.DEVNULL,
             )
             return result.returncode == 0 and "commit" in result.stdout.strip()
         except (subprocess.TimeoutExpired, OSError):
@@ -764,15 +789,15 @@ class GitCache:
         env: dict[str, str] | None = None,
     ) -> None:
         """Fetch a specific SHA into a bare repo. Caller MUST hold the shard lock."""
-        from ..utils.git_env import get_git_executable, git_subprocess_env
+        from ..utils.git_env import get_git_executable, git_network_env
 
         git_exe = get_git_executable()
-        subprocess_env = env if env is not None else git_subprocess_env()
+        subprocess_env = git_network_env(url, env, git_dir=bare_dir)
         # If this is a partial-flavor bare, preserve the filter on fetch
         # so we don't pull all blobs reachable from the new SHA. Detected
         # via shard-suffix naming convention (cheap, no git config probe).
         is_partial = bare_dir.name.endswith(_PARTIAL_BARE_SUFFIX)
-        fetch_args = [git_exe, *_safe_git_args(), "-C", str(bare_dir), "fetch"]
+        fetch_args = [git_exe, *_safe_git_args(), "--git-dir", str(bare_dir), "fetch"]
         if is_partial:
             fetch_args += ["--filter=blob:none"]
         fetch_args += [url, sha]
@@ -783,16 +808,29 @@ class GitCache:
                 text=True,
                 timeout=120,
                 env=subprocess_env,
+                stdin=subprocess.DEVNULL,
                 check=True,
             )
         except subprocess.CalledProcessError:
-            # Some servers don't allow fetching by SHA -- fetch all refs
+            # Some servers do not allow fetching by SHA. Broaden the explicit
+            # validated remote without consulting any configured sibling remote.
+            fallback_fetch_args = [
+                git_exe,
+                *_safe_git_args(),
+                "--git-dir",
+                str(bare_dir),
+                "fetch",
+            ]
+            if is_partial:
+                fallback_fetch_args += ["--filter=blob:none"]
+            fallback_fetch_args += [url, *_FALLBACK_REFSPECS]
             subprocess.run(
-                [git_exe, *_safe_git_args(), "-C", str(bare_dir), "fetch", "--all"],
+                fallback_fetch_args,
                 capture_output=True,
                 text=True,
                 timeout=120,
                 env=subprocess_env,
+                stdin=subprocess.DEVNULL,
                 check=True,
             )
 
@@ -900,20 +938,8 @@ def _dir_size(path: Path) -> int:
     return total
 
 
-def _sanitize_url(url: str) -> str:
-    """Strip credentials from URL for safe logging."""
-    import urllib.parse
+def _sanitize_url(value: str) -> str:
+    """Delegate Git diagnostic redaction to its canonical owner."""
+    from ..utils.git_env import redact_git_diagnostic
 
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.password:
-            # Replace password with ***
-            netloc = parsed.hostname or ""
-            if parsed.username:
-                netloc = f"{parsed.username}:***@{netloc}"
-            if parsed.port:
-                netloc = f"{netloc}:{parsed.port}"
-            return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
-    except Exception:
-        pass
-    return url
+    return redact_git_diagnostic(value)

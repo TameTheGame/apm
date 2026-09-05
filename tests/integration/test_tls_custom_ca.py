@@ -324,7 +324,7 @@ def test_apm_extra_ca_bundle_updates_requests_preloaded_context(custom_ca_server
     _assert_tls_handshake(custom_ca_server.port, published)
 
 
-def test_apm_run_propagates_extra_ca_to_real_child(custom_ca_server, tmp_path):
+def test_apm_run_propagates_extra_ca_to_real_child(custom_ca_server, tmp_path, apm_binary_path):
     """The real CLI-to-runner boundary gives a shell child additive trust."""
     project = tmp_path / "apm-run-project"
     project.mkdir()
@@ -354,7 +354,7 @@ def test_apm_run_propagates_extra_ca_to_real_child(custom_ca_server, tmp_path):
     )
 
     result = subprocess.run(
-        [sys.executable, "-m", "apm_cli.cli", "run", "tls-probe"],
+        [str(apm_binary_path), "run", "tls-probe"],
         cwd=project,
         env=env,
         capture_output=True,
@@ -366,7 +366,7 @@ def test_apm_run_propagates_extra_ca_to_real_child(custom_ca_server, tmp_path):
     assert "ok" in result.stdout.splitlines()
 
 
-def test_invalid_extra_ca_fails_before_real_cli_command(tmp_path):
+def test_invalid_extra_ca_fails_before_real_cli_command(tmp_path, apm_binary_path):
     """A fresh CLI reports one ASCII-safe error before executing the script."""
     project = tmp_path / "invalid-ca-project"
     project.mkdir()
@@ -390,7 +390,7 @@ def test_invalid_extra_ca_fails_before_real_cli_command(tmp_path):
     )
 
     result = subprocess.run(
-        [sys.executable, "-m", "apm_cli.cli", "run", "blocked"],
+        [str(apm_binary_path), "run", "blocked"],
         cwd=project,
         env=env,
         capture_output=True,
