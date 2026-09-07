@@ -195,7 +195,9 @@ class _OkHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def private_ca_https_server(dirpath: Path, ca_common_name: str = "APM Test Root CA"):
+def private_ca_https_server(
+    dirpath: Path, ca_common_name: str = "APM Test Root CA", *, handler=_OkHandler
+):
     """Run one private-CA loopback server and yield its trust material."""
     dirpath.mkdir(parents=True, exist_ok=True)
     try:
@@ -210,7 +212,7 @@ def private_ca_https_server(dirpath: Path, ca_common_name: str = "APM Test Root 
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=str(srv_pem), keyfile=str(srv_key))
 
-    httpd = http.server.HTTPServer(("127.0.0.1", 0), _OkHandler)
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -402,6 +404,7 @@ def test_invalid_extra_ca_fails_before_real_cli_command(tmp_path, apm_binary_pat
     assert result.stdout == ""
     assert result.stderr.count("APM_EXTRA_CA_BUNDLE") == 1
     assert "path does not exist" in result.stderr
+    assert "readable certificate-only PEM, or unset it" in result.stderr
     result.stderr.encode("ascii")
     assert not sentinel.exists()
 
@@ -413,6 +416,7 @@ def test_additive_ca_still_rejects_wrong_server_identity(custom_ca_server, monke
 
     assert configure_tls_trust() is True
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection(("127.0.0.1", custom_ca_server.port), timeout=5) as raw_socket:
         with pytest.raises(ssl.SSLCertVerificationError):
             context.wrap_socket(raw_socket, server_hostname="wrong.example")
@@ -514,6 +518,10 @@ def test_additive_context_retains_independent_existing_root(tmp_path, monkeypatc
             SyntheticDefaultContext, Path(extra.ca_path).read_text(encoding="ascii")
         )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Stdlib property setters resolve SSLContext through the module global.
+        # Restore that name after constructing the additive synthetic context.
+        monkeypatch.setattr(ssl, "SSLContext", stdlib_context)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
 
         _assert_tls_handshake(baseline.port, context)
         _assert_tls_handshake(extra.port, context)

@@ -972,3 +972,34 @@ def test_ensure_child_tls_bootstrap_write_failure_leaves_no_partial(tmp_path, mo
     assert not (site / "_apm_tls_bootstrap.py").exists()
     assert not (site / "_apm_tls.pth").exists()
     assert list(site.glob(".apm_tls_*.tmp")) == []
+
+
+@pytest.mark.parametrize("refresh_succeeds", [False, True])
+def test_managed_bootstrap_refresh_notice_preserves_additive_fallback(
+    tmp_path, monkeypatch, capsys, refresh_succeeds
+):
+    import certifi
+
+    import apm_cli.core.tls_trust as tls
+    from apm_cli.utils.console import _reset_console
+
+    venv = tmp_path / ".apm" / "runtimes" / "llm-venv"
+    venv.mkdir(parents=True)
+    monkeypatch.setattr(tls.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(tls, "ensure_child_tls_bootstrap", lambda _path: refresh_succeeds)
+    _reset_console()
+    try:
+        child = build_child_tls_env({_EXTRA_CA_ENV_VAR: certifi.where()}, runtime_name="llm")
+        output = " ".join(capsys.readouterr().out.split())
+        if refresh_succeeds:
+            assert output == ""
+        else:
+            assert "Could not refresh the managed llm TLS bootstrap" in output
+            assert "file permissions" in output
+            assert "apm runtime setup llm" in output
+            assert "Certificate verification remains enabled" in output
+        assert Path(child["REQUESTS_CA_BUNDLE"]).is_file()
+        assert child[_DERIVED_REQUESTS_CA_MARKER] == child["REQUESTS_CA_BUNDLE"]
+        assert Path(child["NODE_EXTRA_CA_CERTS"]).read_bytes() == Path(certifi.where()).read_bytes()
+    finally:
+        _reset_console()

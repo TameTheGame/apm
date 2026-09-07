@@ -160,7 +160,11 @@ def _configure_logging(verbose: bool = False) -> None:
 def cli(ctx, verbose: bool) -> None:
     """Main entry point for the APM CLI."""
     if _TLS_BOOTSTRAP_ERROR is not None:
-        raise click.ClickException(str(_TLS_BOOTSTRAP_ERROR))
+        raise click.ClickException(
+            f"{_TLS_BOOTSTRAP_ERROR}. "
+            "Set it to a readable certificate-only PEM, or unset it. "
+            "See https://microsoft.github.io/apm/troubleshooting/ssl-issues/"
+        )
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     from apm_cli.core.output_mode import configure_output_mode, detect_output_mode

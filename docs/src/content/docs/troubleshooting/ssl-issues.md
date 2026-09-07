@@ -103,7 +103,7 @@ APM's primary Python HTTP paths use `requests`, a small number of metadata paths
 export APM_EXTRA_CA_BUNDLE=/path/to/corporate-ca.pem
 ```
 
-This retains native OS roots and adds the selected PEM certificates. If the APM parent cannot inject OS trust, Requests-based HTTPS retains the additive certificates over its `certifi` fallback. Set the variable in the environment that launches `apm`; an inline assignment inside an `apm.yml` shell command remains shell-owned and is not translated into `NODE_EXTRA_CA_CERTS`. APM validates the bundle before using it: the file must be regular, readable, non-empty, no larger than 8 MiB, certificate-only ASCII PEM, and contain at least one certificate. Private-key blocks are rejected before any child snapshot is created. Before child launch, APM copies the validated bytes into an APM-owned per-process directory beneath `~/.apm/tls/`, so replacing the source file after validation cannot change the child's trust. Those snapshots are removed when the APM process exits normally. An invalid selected bundle fails closed, so the command or child launch stops rather than silently weakening or bypassing certificate verification.
+This retains native OS roots and adds the selected PEM certificates. If the APM parent cannot inject OS trust, Requests-based HTTPS retains the additive certificates over its `certifi` fallback. APM validates the bundle before using it: the file must be regular, readable, non-empty, no larger than 8 MiB, certificate-only ASCII PEM, and contain at least one certificate. Private-key blocks are rejected before any child snapshot is created. Before child launch, APM copies the validated bytes into an APM-owned per-process directory beneath `~/.apm/tls/`, so replacing the source file after validation cannot change the child's trust. Those snapshots are removed when the APM process exits normally. An invalid selected bundle fails closed, so the command or child launch stops rather than silently weakening or bypassing certificate verification.
 
 Use a replacement bundle only when you intend to pin the entire Python trust set:
 
@@ -112,6 +112,28 @@ export REQUESTS_CA_BUNDLE=/path/to/ca-bundle.pem
 ```
 
 `REQUESTS_CA_BUNDLE` wins for `requests`. `SSL_CERT_FILE` / `SSL_CERT_DIR` cover parts of the stdlib TLS stack, but on their own they are not reliable overrides for the `requests` HTTP path APM uses.
+
+### Shell commands and per-script trust controls
+
+APM resolves trust precedence and prepares the child environment **before** an
+`apm.yml` shell command executes. Set `APM_EXTRA_CA_BUNDLE`,
+`APM_DISABLE_TRUSTSTORE`, `REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` in the
+environment that launches APM. For example, on POSIX:
+
+```bash
+APM_DISABLE_TRUSTSTORE=1 apm run probe
+CURL_CA_BUNDLE=/path/to/replacement.pem apm run probe
+```
+
+Assignments inside the shell command remain shell-owned. An inline additive
+assignment is not translated into `NODE_EXTRA_CA_CERTS`; an inline opt-out or
+curl replacement cannot remove the Requests/Node settings APM already derived.
+An inline `REQUESTS_CA_BUNDLE` is honored by Requests, but does not remove an
+inherited Node CA setting. Likewise, Node honors an explicit `NODE_EXTRA_CA_CERTS`
+but does not interpret APM's opt-out variable. A nested APM invocation recomputes
+its own child environment and clears inherited APM-derived values when its
+disable or replacement controls win; a direct Python/Node child does not perform
+that APM step.
 
 ### Node children
 

@@ -680,7 +680,14 @@ def _refresh_managed_llm_tls_bootstrap(runtime_name: str | None) -> None:
         # Python children still receive the certifi+extra Requests snapshot, so
         # refresh failure is a safe compatibility fallback rather than a reason
         # to launch without the selected additive CA.
-        logger.debug("TLS: could not refresh the managed llm bootstrap at launch")
+        from ..utils.console import _rich_warning
+
+        _rich_warning(
+            "Could not refresh the managed llm TLS bootstrap; native OS trust may be unavailable. "
+            "Check the runtime's file permissions and re-run `apm runtime setup llm`. "
+            "Certificate verification remains enabled.",
+            symbol="warning",
+        )
 
 
 def build_child_tls_env(
