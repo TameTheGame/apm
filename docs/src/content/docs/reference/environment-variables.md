@@ -56,9 +56,7 @@ APM verifies HTTPS against the operating-system trust store by default, with bun
 
 Trust resolution is ordered: `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `APM_DISABLE_TRUSTSTORE`, `APM_EXTRA_CA_BUNDLE`, the OS trust store, then bundled `certifi` as the final Requests fallback. The `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` settings replace normal Requests trust; `APM_DISABLE_TRUSTSTORE` suppresses OS/additive propagation without deleting those replacements; `APM_EXTRA_CA_BUNDLE` augments the selected defaults. APM derives child settings only when the additive bundle wins this precedence.
 
-If the APM parent cannot inject OS trust, its Requests-based HTTPS retains the selected additive certificates over the `certifi` fallback. Other stdlib HTTPS callers do not consult `REQUESTS_CA_BUNDLE`. Python/Requests children use an APM-owned merged snapshot containing `certifi` and the validated extra certificates. The managed Python child additionally uses `truststore` for OS-plus-extra behavior when that package is available.
-
-`APM_EXTRA_CA_BUNDLE` covers APM's truststore-backed Python contexts and parent Requests HTTPS, Python/Requests children launched by `apm run`, the managed Python child, and Node child startup. Child snapshots live in a per-process directory beneath `~/.apm/tls/` and are removed when the parent process exits normally. Git keeps its own trust settings, and Rust-based Codex retains its runtime-owned trust configuration.
+See [runtime coverage and limitations](../../troubleshooting/ssl-issues/#runtime-coverage) for Python, Node, Git, and Rust behavior, fallback trust, and snapshot lifetime.
 
 ## Registry (MCP and proxy)
 

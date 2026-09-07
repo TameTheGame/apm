@@ -119,7 +119,7 @@ def _restore_tls_publication_state(state):
 
 
 def _install_additive_context(truststore, bundle_pem):
-    """Transactionally install an OS context class plus *bundle_pem*."""
+    """Publish OS-plus-extra trust; _bootstrap owns rollback on failure."""
 
     class _APMExtraCAContext(truststore.SSLContext):
         def __init__(self, protocol=None):
@@ -131,18 +131,13 @@ def _install_additive_context(truststore, bundle_pem):
     if not candidate.check_hostname or candidate.verify_mode != _ssl.CERT_REQUIRED:
         raise RuntimeError("additive TLS context weakened peer verification")
 
-    state = _capture_tls_publication_state()
-    _original_ssl, urllib3_ssl, _urllib3_context, requests_adapters, preloaded = state
-    try:
-        _ssl.SSLContext = _APMExtraCAContext
-        if urllib3_ssl is not None:
-            urllib3_ssl.SSLContext = _APMExtraCAContext
-        if requests_adapters is not None and preloaded is not _MISSING_TLS_REFERENCE:
-            requests_adapters._preloaded_ssl_context = candidate
-    except Exception:
-        _restore_tls_publication_state(state)
-        raise
-    return True
+    _ssl.SSLContext = _APMExtraCAContext
+    urllib3_ssl = _sys.modules.get("urllib3.util.ssl_")
+    if urllib3_ssl is not None:
+        urllib3_ssl.SSLContext = _APMExtraCAContext
+    requests_adapters = _sys.modules.get("requests.adapters")
+    if requests_adapters is not None and hasattr(requests_adapters, "_preloaded_ssl_context"):
+        requests_adapters._preloaded_ssl_context = candidate
 
 
 def _bootstrap():

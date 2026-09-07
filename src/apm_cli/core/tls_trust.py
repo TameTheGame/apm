@@ -403,11 +403,9 @@ def _restore_tls_publication_state(
 def _install_additive_ca_context(base_context: type[ssl.SSLContext], bundle_pem: str) -> None:
     """Publish an SSLContext type that loads *bundle_pem* on construction.
 
-    The new type is fully instantiated and checked before it becomes visible to
-    ``ssl``, urllib3, or Requests. Publication is transactional: if any global
-    assignment fails, every reference is restored to its prior value. Requests
-    2.32's optional preloaded context is replaced with the already-validated
-    candidate instead of mutating an existing shared context in place.
+    Validate the candidate before publishing it. ``configure_tls_trust`` owns
+    rollback for the entire injection, including any failure in this helper.
+    Replace Requests 2.32's optional preloaded context without mutating it.
     """
 
     if base_context is _STDLIB_SSL_CONTEXT:
@@ -427,19 +425,13 @@ def _install_additive_ca_context(base_context: type[ssl.SSLContext], bundle_pem:
     if not candidate.check_hostname or candidate.verify_mode != ssl.CERT_REQUIRED:
         raise TLSConfigurationError("Additive TLS context did not preserve peer verification")
 
-    publication_state = _capture_tls_publication_state()
-    _original_ssl_context, urllib3_ssl, _urllib3_context, requests_adapters, preloaded = (
-        publication_state
-    )
-    try:
-        ssl.SSLContext = _APMExtraCAContext  # type: ignore[misc]
-        if urllib3_ssl is not None:
-            urllib3_ssl.SSLContext = _APMExtraCAContext
-        if requests_adapters is not None and preloaded is not _MISSING_TLS_REFERENCE:
-            requests_adapters._preloaded_ssl_context = candidate
-    except Exception as exc:
-        _restore_tls_publication_state(publication_state)
-        raise TLSConfigurationError("Could not publish the additive TLS context") from exc
+    ssl.SSLContext = _APMExtraCAContext  # type: ignore[misc]
+    urllib3_ssl = sys.modules.get("urllib3.util.ssl_")
+    if urllib3_ssl is not None:
+        urllib3_ssl.SSLContext = _APMExtraCAContext
+    requests_adapters = sys.modules.get("requests.adapters")
+    if requests_adapters is not None and hasattr(requests_adapters, "_preloaded_ssl_context"):
+        requests_adapters._preloaded_ssl_context = candidate
 
 
 def _mutable_environ(env: Mapping[str, str] | None) -> MutableMapping[str, str]:
@@ -502,34 +494,17 @@ def configure_tls_trust(env: Mapping[str, str] | None = None) -> bool:
     extra_ca_pem = extra_ca[1] if extra_ca is not None else ""
     extra_ca_display = _safe_path_display(Path(extra_ca_path)) if extra_ca_path else ""
 
-    try:
-        # Broad except: a broken/incompatible install can fail at import, not
-        # only with ImportError -- degrade instead of crashing startup.
-        import truststore
-    except Exception as exc:
-        if extra_ca is not None:
-            _extra_snapshot, merged_snapshot = _ensure_child_ca_snapshots(extra_ca_pem)
-            environ["REQUESTS_CA_BUNDLE"] = merged_snapshot
-            environ[_DERIVED_REQUESTS_CA_MARKER] = merged_snapshot
-            _record_tls_trust_status(
-                "TLS: verifying against bundled CA plus additive CA: %s (certifi fallback) [%s]",
-                extra_ca_display,
-                exc,
-            )
-            return False
-        _record_tls_trust_status("TLS: verifying against bundled CA (certifi fallback) [%s]", exc)
-        return False
-
-    # If the frozen hook pinned SSL_CERT_FILE to bundled certifi, pop it so
-    # truststore's set_default_verify_paths() reads the genuine system default.
-    # A user-set SSL_CERT_FILE (no marker) is left untouched.
     bundled_cert: str | None = None
-    if environ.get(_SSL_CERT_FILE_VAR) and had_bundled_marker:
-        bundled_cert = environ.get(_SSL_CERT_FILE_VAR)
-        environ.pop(_SSL_CERT_FILE_VAR, None)
-
     publication_state = _capture_tls_publication_state()
     try:
+        # Import and injection failures share the same verified fallback.
+        import truststore
+
+        # Remove only the frozen hook's certifi default so truststore can read
+        # the OS roots. Preserve a user-selected SSL_CERT_FILE.
+        if environ.get(_SSL_CERT_FILE_VAR) and had_bundled_marker:
+            bundled_cert = environ.pop(_SSL_CERT_FILE_VAR)
+
         truststore.inject_into_ssl()
         if extra_ca is not None:
             _install_additive_ca_context(truststore.SSLContext, extra_ca_pem)

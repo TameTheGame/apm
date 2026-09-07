@@ -195,7 +195,7 @@ class _OkHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def _private_ca_server(dirpath: Path, ca_common_name: str = "APM Test Root CA"):
+def private_ca_https_server(dirpath: Path, ca_common_name: str = "APM Test Root CA"):
     """Run one private-CA loopback server and yield its trust material."""
     dirpath.mkdir(parents=True, exist_ok=True)
     try:
@@ -232,7 +232,7 @@ def _private_ca_server(dirpath: Path, ca_common_name: str = "APM Test Root CA"):
 def custom_ca_server(tmp_path_factory):
     """A loopback HTTPS server presenting a leaf signed by a private CA."""
     dirpath = tmp_path_factory.mktemp("tls_custom_ca")
-    with _private_ca_server(dirpath) as server:
+    with private_ca_https_server(dirpath) as server:
         yield server
 
 
@@ -418,19 +418,28 @@ def test_additive_ca_still_rejects_wrong_server_identity(custom_ca_server, monke
             context.wrap_socket(raw_socket, server_hostname="wrong.example")
 
 
-def test_additive_ca_survives_real_requests_fallback(tmp_path):
+@pytest.mark.parametrize("failure", ["import", "publication"])
+def test_additive_ca_survives_real_requests_fallback(tmp_path, failure):
     """A fresh process keeps stdlib SSL usable and reaches the CA on fallback."""
-    with _private_ca_server(tmp_path / "fallback", "APM Fallback Extra Root") as server:
+    with private_ca_https_server(tmp_path / "fallback", "APM Fallback Extra Root") as server:
         probe = """
 import json
 import os
 import ssl
 import sys
 
-sys.modules["truststore"] = None
-from apm_cli.core.tls_trust import configure_tls_trust
+import apm_cli.core.tls_trust as tls
 
-configured = configure_tls_trust()
+if sys.argv[2] == "import":
+    sys.modules["truststore"] = None
+else:
+    original_install = tls._install_additive_ca_context
+    def fail_after_publication(*args):
+        original_install(*args)
+        raise RuntimeError("forced failure after additive TLS publication")
+    tls._install_additive_ca_context = fail_after_publication
+
+configured = tls.configure_tls_trust()
 context = ssl.create_default_context()
 import requests
 
@@ -453,7 +462,7 @@ print(json.dumps({
         env["APM_EXTRA_CA_BUNDLE"] = server.ca_path
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
         result = subprocess.run(
-            [sys.executable, "-c", probe, server.url],
+            [sys.executable, "-c", probe, server.url, failure],
             cwd=Path(__file__).resolve().parents[2],
             env=env,
             capture_output=True,
@@ -485,8 +494,8 @@ def test_additive_context_retains_independent_existing_root(tmp_path, monkeypatc
     import urllib3.util.ssl_ as urllib3_ssl
 
     with (
-        _private_ca_server(tmp_path / "baseline", "APM Synthetic Baseline Root") as baseline,
-        _private_ca_server(tmp_path / "extra", "APM Synthetic Extra Root") as extra,
+        private_ca_https_server(tmp_path / "baseline", "APM Synthetic Baseline Root") as baseline,
+        private_ca_https_server(tmp_path / "extra", "APM Synthetic Extra Root") as extra,
     ):
         stdlib_context = ssl.SSLContext
 

@@ -50,8 +50,7 @@ from apm_cli.core.tls_trust import (
 )
 from apm_cli.runtime.manager import RuntimeManager
 
-from ._tls_ca_server import private_ca_https_server
-from .test_tls_custom_ca import _OPENSSL_EXECUTABLE
+from .test_tls_custom_ca import _OPENSSL_EXECUTABLE, private_ca_https_server
 
 pytestmark = pytest.mark.integration
 
